@@ -199,6 +199,9 @@ impl ProxyHandler {
 
         for (name, value) in headers.iter() {
             let lower = name.as_str().to_lowercase();
+            if lower == "host" {
+                continue;
+            }
             if HOP_BY_HOP_HEADERS.contains(&lower.as_str()) {
                 continue;
             }
