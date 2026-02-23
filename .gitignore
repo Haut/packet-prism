@@ -1,1 +1,14 @@
 /target
+
+# Environment config
+.env
+.env.*
+!.env.example
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

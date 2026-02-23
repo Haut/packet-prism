@@ -1,0 +1,16 @@
+[Unit]
+Description=packet-prism outbound proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/packet-prism
+EnvironmentFile=/etc/packet-prism/.env
+Restart=on-failure
+RestartSec=5
+DynamicUser=yes
+StateDirectory=packet-prism
+WorkingDirectory=/var/lib/packet-prism
+
+[Install]
+WantedBy=multi-user.target

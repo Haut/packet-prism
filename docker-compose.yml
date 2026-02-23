@@ -1,0 +1,8 @@
+services:
+  proxy:
+    build: .
+    container_name: packet-prism
+    restart: unless-stopped
+    # Host network is required so the process can bind to specific local IPs.
+    network_mode: host
+    env_file: .env
