@@ -2,7 +2,6 @@ mod config;
 mod pool;
 mod proxy;
 mod ratelimit;
-mod strategy;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +18,6 @@ use tokio::net::TcpListener;
 use config::Config;
 use pool::Pool;
 use proxy::ProxyHandler;
-use strategy::ProxyStrategy;
 
 #[tokio::main]
 async fn main() {
@@ -38,13 +36,6 @@ async fn main() {
     let cooldown = Duration::from_secs(validated.cooldown_secs);
     let rate_timeout = Duration::from_millis(validated.rate_timeout_ms);
 
-    let strategy = Arc::new(ProxyStrategy::new(
-        pool,
-        cooldown,
-        validated.rate_limit,
-        rate_timeout,
-    ));
-
     tracing::info!(
         ips = validated.parsed_ips.len(),
         cooldown_secs = validated.cooldown_secs,
@@ -53,7 +44,10 @@ async fn main() {
     );
 
     let handler = Arc::new(ProxyHandler::new(
-        strategy,
+        pool,
+        cooldown,
+        validated.rate_limit,
+        rate_timeout,
         validated.target_url.clone(),
         validated.user_agent.clone(),
     ));

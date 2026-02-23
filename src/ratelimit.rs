@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use crate::strategy::ProxyError;
+use crate::proxy::ProxyError;
 
 struct Inner {
     rate: f64,

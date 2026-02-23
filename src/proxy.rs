@@ -1,12 +1,15 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
+use reqwest::StatusCode as ReqwestStatus;
 use url::Url;
 
-use crate::strategy::{ProxyError, ProxyStrategy};
+use crate::pool::Pool;
+use crate::ratelimit::Limiter;
 
 const MAX_BODY_SIZE: usize = 10 << 20; // 10 MB
 
@@ -30,16 +33,56 @@ const CLIENT_IDENTIFYING_HEADERS: &[&str] = &[
     "x-originating-ip",
 ];
 
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyError {
+    #[error("no IPs available")]
+    NoIPs,
+    #[error("all IPs exhausted")]
+    AllIPsExhausted,
+    #[error("rate limit exceeded")]
+    RateLimited,
+    #[error("upstream error: {0}")]
+    Upstream(#[from] reqwest::Error),
+}
+
+impl ProxyError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ProxyError::NoIPs | ProxyError::AllIPsExhausted | ProxyError::RateLimited => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
 pub struct ProxyHandler {
-    strategy: Arc<ProxyStrategy>,
+    pool: Arc<Pool>,
+    cooldown: Duration,
+    limiter: Option<(Arc<Limiter>, Duration)>,
     target_url: Url,
     user_agent: Option<String>,
 }
 
 impl ProxyHandler {
-    pub fn new(strategy: Arc<ProxyStrategy>, target_url: Url, user_agent: Option<String>) -> Self {
+    pub fn new(
+        pool: Arc<Pool>,
+        cooldown: Duration,
+        rate_limit: u32,
+        rate_timeout: Duration,
+        target_url: Url,
+        user_agent: Option<String>,
+    ) -> Self {
+        let limiter = if rate_limit > 0 {
+            Some((Arc::new(Limiter::new(rate_limit)), rate_timeout))
+        } else {
+            None
+        };
+
         Self {
-            strategy,
+            pool,
+            cooldown,
+            limiter,
             target_url,
             user_agent,
         }
@@ -49,14 +92,12 @@ impl ProxyHandler {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        // Extract parts before consuming the body
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
 
         tracing::info!(method = %method, uri = %uri, "incoming request");
 
-        // Buffer body with size limit
         let body_bytes = match read_body(req.into_body()).await {
             Ok(b) => b,
             Err(_) => {
@@ -67,7 +108,6 @@ impl ProxyHandler {
             }
         };
 
-        // Build outgoing request
         let out_req = match self.build_outgoing(&method, &uri, &headers, &body_bytes) {
             Ok(r) => r,
             Err(e) => {
@@ -76,8 +116,7 @@ impl ProxyHandler {
             }
         };
 
-        // Execute via strategy
-        match self.strategy.execute(out_req).await {
+        match self.execute(out_req).await {
             Ok(resp) => {
                 tracing::info!(
                     method = %method,
@@ -89,13 +128,54 @@ impl ProxyHandler {
             }
             Err(e) => {
                 let status = e.status_code();
-                tracing::error!(method = %method, uri = %uri, error = %e, "strategy error");
+                tracing::error!(method = %method, uri = %uri, error = %e, "proxy error");
                 Ok(error_response(
                     status,
                     status.canonical_reason().unwrap_or("error"),
                 ))
             }
         }
+    }
+
+    async fn execute(&self, req: reqwest::Request) -> Result<reqwest::Response, ProxyError> {
+        if let Some((ref limiter, timeout)) = self.limiter {
+            limiter.wait(timeout).await?;
+        }
+
+        for attempt in 0..self.pool.len() {
+            let slot = self.pool.acquire().ok_or(ProxyError::NoIPs)?;
+
+            tracing::info!(
+                method = %req.method(),
+                url = %req.url(),
+                ip = ?slot.ip,
+                attempt = attempt + 1,
+                "upstream request"
+            );
+
+            let cloned = req
+                .try_clone()
+                .expect("request body must be cloneable for retries");
+
+            match slot.client.execute(cloned).await {
+                Ok(resp) if resp.status() == ReqwestStatus::TOO_MANY_REQUESTS => {
+                    tracing::warn!(ip = ?slot.ip, cooldown = ?self.cooldown, "429, cooling down");
+                    self.pool.cooldown(slot, self.cooldown);
+                    continue;
+                }
+                Ok(resp) => {
+                    self.pool.release(slot);
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    tracing::warn!(ip = ?slot.ip, error = %e, "error, cooling down");
+                    self.pool.cooldown(slot, self.cooldown);
+                    continue;
+                }
+            }
+        }
+
+        Err(ProxyError::AllIPsExhausted)
     }
 
     fn build_outgoing(
@@ -109,11 +189,10 @@ impl ProxyHandler {
         target.set_path(&single_joining_slash(self.target_url.path(), uri.path()));
         target.set_query(uri.query());
 
-        let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-            .expect("valid HTTP method");
+        let method =
+            reqwest::Method::from_bytes(method.as_str().as_bytes()).expect("valid HTTP method");
 
-        // Use a bare Client just for building the request — the strategy's
-        // own client (with local_address binding etc.) will execute it.
+        // Bare client just for building the request — each slot's client executes it.
         let mut builder = reqwest::Client::new()
             .request(method, target.as_str())
             .body(body.clone());
