@@ -265,6 +265,11 @@ async fn convert_response(resp: reqwest::Response) -> Response<Full<Bytes>> {
         if HOP_BY_HOP_HEADERS.contains(&lower.as_str()) {
             continue;
         }
+        // reqwest auto-decompresses the body, so these headers no longer
+        // match the actual payload we send back.
+        if lower == "content-encoding" || lower == "content-length" {
+            continue;
+        }
         response.headers_mut().append(name.clone(), value.clone());
     }
 
