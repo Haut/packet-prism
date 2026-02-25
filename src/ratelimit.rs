@@ -2,7 +2,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use crate::proxy::ProxyError;
+#[derive(Debug, thiserror::Error)]
+#[error("rate limit timeout")]
+pub struct RateLimitTimeout;
 
 struct Inner {
     rate: f64,
@@ -28,7 +30,7 @@ impl Limiter {
         }
     }
 
-    pub async fn wait(&self, timeout: Duration) -> Result<(), ProxyError> {
+    pub async fn wait(&self, timeout: Duration) -> Result<(), RateLimitTimeout> {
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -43,7 +45,7 @@ impl Limiter {
                 let wait = Duration::from_secs_f64(wait_secs);
 
                 if Instant::now() + wait > deadline {
-                    return Err(ProxyError::RateLimited);
+                    return Err(RateLimitTimeout);
                 }
                 // drop lock before sleeping
                 drop(inner);

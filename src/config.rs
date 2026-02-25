@@ -3,6 +3,14 @@ use std::net::IpAddr;
 use clap::Parser;
 use url::Url;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("invalid --target: {0}")]
+    InvalidTarget(String),
+    #[error("invalid IP: {0}")]
+    InvalidIp(String),
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "packet-prism",
@@ -50,10 +58,13 @@ pub struct ValidatedConfig {
 }
 
 impl Config {
-    pub fn validate(self) -> Result<ValidatedConfig, String> {
-        let url = Url::parse(&self.target).map_err(|e| format!("invalid --target: {e}"))?;
+    pub fn validate(self) -> Result<ValidatedConfig, ConfigError> {
+        let url =
+            Url::parse(&self.target).map_err(|e| ConfigError::InvalidTarget(e.to_string()))?;
         if url.scheme().is_empty() || url.host().is_none() {
-            return Err("invalid --target: must include scheme and host".into());
+            return Err(ConfigError::InvalidTarget(
+                "must include scheme and host".into(),
+            ));
         }
 
         let mut parsed_ips = Vec::new();
@@ -63,7 +74,9 @@ impl Config {
                 if raw.is_empty() {
                     continue;
                 }
-                let ip: IpAddr = raw.parse().map_err(|_| format!("invalid IP: {raw}"))?;
+                let ip: IpAddr = raw
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidIp(raw.to_string()))?;
                 parsed_ips.push(ip);
             }
         }

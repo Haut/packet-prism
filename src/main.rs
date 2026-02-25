@@ -15,7 +15,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use config::Config;
+use config::{Config, ValidatedConfig};
 use pool::Pool;
 use proxy::ProxyHandler;
 
@@ -24,36 +24,42 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let cfg = Config::parse();
-    let validated = match cfg.validate() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
+    let Ok(validated) = cfg.validate().inspect_err(|e| eprintln!("error: {e}")) else {
+        std::process::exit(1);
     };
 
-    let pool = Arc::new(Pool::new(&validated.parsed_ips));
-    let cooldown = Duration::from_secs(validated.cooldown_secs);
-    let rate_timeout = Duration::from_millis(validated.rate_timeout_ms);
+    let ValidatedConfig {
+        listen,
+        target_url,
+        user_agent,
+        parsed_ips,
+        cooldown_secs,
+        rate_limit,
+        rate_timeout_ms,
+    } = validated;
+
+    let pool = Arc::new(Pool::new(&parsed_ips));
+    let cooldown = Duration::from_secs(cooldown_secs);
+    let rate_timeout = Duration::from_millis(rate_timeout_ms);
 
     tracing::info!(
-        ips = validated.parsed_ips.len(),
-        cooldown_secs = validated.cooldown_secs,
-        rate_limit = validated.rate_limit,
+        ips = parsed_ips.len(),
+        cooldown_secs,
+        rate_limit,
         "starting"
     );
 
     let handler = Arc::new(ProxyHandler::new(
         pool,
         cooldown,
-        validated.rate_limit,
+        rate_limit,
         rate_timeout,
-        validated.target_url.clone(),
-        validated.user_agent.clone(),
+        target_url.clone(),
+        user_agent,
     ));
 
-    let addr: SocketAddr = validated.listen.parse().unwrap_or_else(|e| {
-        eprintln!("invalid listen address '{}': {e}", validated.listen);
+    let addr: SocketAddr = listen.parse().unwrap_or_else(|e| {
+        eprintln!("invalid listen address '{listen}': {e}");
         std::process::exit(1);
     });
 
@@ -62,7 +68,7 @@ async fn main() {
         std::process::exit(1);
     });
 
-    tracing::info!(listen = %addr, target = %validated.target_url, "listening");
+    tracing::info!(listen = %addr, target = %target_url, "listening");
 
     // Graceful shutdown signal
     let shutdown = async {
@@ -89,12 +95,10 @@ async fn main() {
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _remote) = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!(error = %e, "accept error");
-                        continue;
-                    }
+                let Ok((stream, _)) = result.inspect_err(|e| {
+                    tracing::error!(error = %e, "accept error");
+                }) else {
+                    continue;
                 };
 
                 stream.set_nodelay(true).ok();

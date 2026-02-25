@@ -10,7 +10,7 @@ use reqwest::StatusCode as ReqwestStatus;
 use url::Url;
 
 use crate::pool::Pool;
-use crate::ratelimit::Limiter;
+use crate::ratelimit::{Limiter, RateLimitTimeout};
 
 const MAX_BODY_SIZE: usize = 10 << 20; // 10 MB
 
@@ -36,8 +36,6 @@ const CLIENT_IDENTIFYING_HEADERS: &[&str] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("no IPs available")]
-    NoIPs,
     #[error("all IPs exhausted")]
     AllIPsExhausted,
     #[error("rate limit exceeded")]
@@ -46,10 +44,16 @@ pub enum ProxyError {
     Upstream(#[from] reqwest::Error),
 }
 
+impl From<RateLimitTimeout> for ProxyError {
+    fn from(_: RateLimitTimeout) -> Self {
+        ProxyError::RateLimited
+    }
+}
+
 impl ProxyError {
     fn status_code(&self) -> StatusCode {
         match self {
-            ProxyError::NoIPs | ProxyError::AllIPsExhausted | ProxyError::RateLimited => {
+            ProxyError::AllIPsExhausted | ProxyError::RateLimited => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
@@ -65,7 +69,7 @@ pub struct ProxyHandler {
     target_base: String,
     host_header: Option<String>,
     user_agent: Option<String>,
-    request_builder: reqwest::Client,
+    outgoing_client: reqwest::Client,
 }
 
 impl ProxyHandler {
@@ -98,10 +102,10 @@ impl ProxyHandler {
                 .unwrap_or_default()
         );
 
-        let request_builder = reqwest::Client::builder()
+        let outgoing_client = reqwest::Client::builder()
             .no_proxy()
             .build()
-            .expect("failed to build request-builder client");
+            .expect("failed to build outgoing client");
 
         Self {
             pool,
@@ -111,7 +115,7 @@ impl ProxyHandler {
             target_base,
             host_header,
             user_agent,
-            request_builder,
+            outgoing_client,
         }
     }
 
@@ -123,24 +127,20 @@ impl ProxyHandler {
 
         tracing::info!(method = %parts.method, uri = %parts.uri, "incoming request");
 
-        let body_bytes = match read_body(body).await {
-            Ok(b) => b,
-            Err(_) => {
-                return Ok(error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body too large",
-                ));
-            }
+        let Ok(body_bytes) = read_body(body).await else {
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large",
+            ));
         };
 
-        let out_req =
-            match self.build_outgoing(&parts.method, &parts.uri, &parts.headers, &body_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(error = %e, "build request error");
-                    return Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"));
-                }
-            };
+        let out_req = match self.build_outgoing(&parts, &body_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "build request error");
+                return Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"));
+            }
+        };
 
         match self.execute(out_req).await {
             Ok(resp) => {
@@ -169,7 +169,9 @@ impl ProxyHandler {
         }
 
         for attempt in 0..self.pool.len() {
-            let slot = self.pool.acquire().ok_or(ProxyError::NoIPs)?;
+            let Some(slot) = self.pool.acquire() else {
+                return Err(ProxyError::AllIPsExhausted);
+            };
 
             tracing::info!(
                 method = %req.method(),
@@ -206,14 +208,12 @@ impl ProxyHandler {
 
     fn build_outgoing(
         &self,
-        method: &hyper::Method,
-        uri: &hyper::Uri,
-        headers: &hyper::HeaderMap,
+        parts: &hyper::http::request::Parts,
         body: &Bytes,
     ) -> Result<reqwest::Request, ProxyError> {
         let base_path = self.target_url.path();
-        let req_path = uri.path();
-        let query = uri.query();
+        let req_path = parts.uri.path();
+        let query = parts.uri.query();
 
         let cap = self.target_base.len()
             + base_path.len()
@@ -246,15 +246,15 @@ impl ProxyHandler {
             target.push_str(q);
         }
 
-        let method =
-            reqwest::Method::from_bytes(method.as_str().as_bytes()).expect("valid HTTP method");
+        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+            .expect("valid HTTP method");
 
         let mut builder = self
-            .request_builder
+            .outgoing_client
             .request(method, &target)
             .body(body.clone());
 
-        for (name, value) in headers.iter() {
+        for (name, value) in parts.headers.iter() {
             if name == header::HOST {
                 continue;
             }
@@ -313,20 +313,15 @@ async fn convert_response(resp: reqwest::Response) -> Response<Full<Bytes>> {
     *response.status_mut() =
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    let mut last_name = None;
-    for (opt_name, value) in resp_headers.into_iter() {
-        if let Some(n) = opt_name {
-            last_name = Some(n);
-        }
-        let name = last_name.as_ref().unwrap();
+    for (name, value) in resp_headers.iter() {
         let s = name.as_str();
-        if HOP_BY_HOP_HEADERS.contains(&s) {
+        if HOP_BY_HOP_HEADERS.contains(&s)
+            || *name == header::CONTENT_ENCODING
+            || *name == header::CONTENT_LENGTH
+        {
             continue;
         }
-        if *name == header::CONTENT_ENCODING || *name == header::CONTENT_LENGTH {
-            continue;
-        }
-        response.headers_mut().append(name.clone(), value);
+        response.headers_mut().append(name.clone(), value.clone());
     }
 
     response
