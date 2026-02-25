@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use futures_util::StreamExt;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::header;
 use hyper::{Request, Response, StatusCode};
 use reqwest::StatusCode as ReqwestStatus;
@@ -11,6 +13,8 @@ use url::Url;
 
 use crate::pool::Pool;
 use crate::ratelimit::{Limiter, RateLimitTimeout};
+
+type BoxBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 const MAX_BODY_SIZE: usize = 10 << 20; // 10 MB
 
@@ -47,17 +51,6 @@ pub enum ProxyError {
 impl From<RateLimitTimeout> for ProxyError {
     fn from(_: RateLimitTimeout) -> Self {
         ProxyError::RateLimited
-    }
-}
-
-impl ProxyError {
-    fn status_code(&self) -> StatusCode {
-        match self {
-            ProxyError::AllIPsExhausted | ProxyError::RateLimited => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-            ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
-        }
     }
 }
 
@@ -119,18 +112,23 @@ impl ProxyHandler {
         }
     }
 
-    pub async fn handle(
-        &self,
-        req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<BoxBody>, hyper::Error> {
         let (parts, body) = req.into_parts();
 
         tracing::info!(method = %parts.method, uri = %parts.uri, "incoming request");
 
-        let Ok(body_bytes) = read_body(body).await else {
+        let content_len_hint = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1024)
+            .min(MAX_BODY_SIZE);
+
+        let Ok(body_bytes) = read_body(body, content_len_hint).await else {
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "request body too large",
+                b"request body too large\n",
             ));
         };
 
@@ -138,7 +136,7 @@ impl ProxyHandler {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "build request error");
-                return Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"));
+                return Ok(error_response(StatusCode::BAD_GATEWAY, b"bad gateway\n"));
             }
         };
 
@@ -150,15 +148,17 @@ impl ProxyHandler {
                     status = resp.status().as_u16(),
                     "upstream response"
                 );
-                Ok(convert_response(resp).await)
+                Ok(convert_response(resp))
             }
             Err(e) => {
-                let status = e.status_code();
                 tracing::error!(method = %parts.method, uri = %parts.uri, error = %e, "proxy error");
-                Ok(error_response(
-                    status,
-                    status.canonical_reason().unwrap_or("error"),
-                ))
+                let (status, body): (StatusCode, &[u8]) = match e {
+                    ProxyError::AllIPsExhausted | ProxyError::RateLimited => {
+                        (StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable\n")
+                    }
+                    ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, b"Bad Gateway\n"),
+                };
+                Ok(error_response(status, body))
             }
         }
     }
@@ -280,8 +280,8 @@ impl ProxyHandler {
     }
 }
 
-async fn read_body(body: Incoming) -> Result<Bytes, ()> {
-    let mut collected = BytesMut::with_capacity(1024);
+async fn read_body(body: Incoming, capacity_hint: usize) -> Result<Bytes, ()> {
+    let mut collected = BytesMut::with_capacity(capacity_hint);
     let mut remaining = MAX_BODY_SIZE;
     let mut stream = body;
 
@@ -304,16 +304,15 @@ async fn read_body(body: Incoming) -> Result<Bytes, ()> {
     Ok(collected.freeze())
 }
 
-async fn convert_response(resp: reqwest::Response) -> Response<Full<Bytes>> {
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-    let body = resp.bytes().await.unwrap_or_default();
+fn convert_response(resp: reqwest::Response) -> Response<BoxBody> {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    let mut response = Response::new(Full::new(body));
-    *response.status_mut() =
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = Response::builder()
+        .status(status)
+        .body(BoxBody::default())
+        .unwrap();
 
-    for (name, value) in resp_headers.iter() {
+    for (name, value) in resp.headers().iter() {
         let s = name.as_str();
         if HOP_BY_HOP_HEADERS.contains(&s)
             || *name == header::CONTENT_ENCODING
@@ -324,11 +323,17 @@ async fn convert_response(resp: reqwest::Response) -> Response<Full<Bytes>> {
         response.headers_mut().append(name.clone(), value.clone());
     }
 
+    let stream = resp
+        .bytes_stream()
+        .map(|r| r.map(Frame::data).map_err(std::io::Error::other));
+    *response.body_mut() = UnsyncBoxBody::new(StreamBody::new(stream));
+
     response
 }
 
-fn error_response(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
-    let mut resp = Response::new(Full::new(Bytes::from(format!("{msg}\n"))));
+fn error_response(status: StatusCode, msg: &'static [u8]) -> Response<BoxBody> {
+    let body = Full::new(Bytes::from_static(msg)).map_err(|never| match never {});
+    let mut resp = Response::new(UnsyncBoxBody::new(body));
     *resp.status_mut() = status;
     resp
 }

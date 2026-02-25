@@ -125,7 +125,7 @@ impl Pool {
 
     pub fn cooldown(&self, slot: &Slot, duration: Duration) {
         let until = self.now_ms() + duration.as_millis() as u64;
-        slot.cool_until_ms.store(until, Ordering::Release);
+        slot.cool_until_ms.store(until, Ordering::Relaxed);
         slot.state
             .store(SlotState::Cooling as i32, Ordering::Release);
     }
