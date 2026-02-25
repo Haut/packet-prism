@@ -1,6 +1,6 @@
 BINARY  := packet-prism
 
-.PHONY: build run fmt clippy clean docker install
+.PHONY: build run fmt clippy clean docker install test
 
 build:
 	cargo build --release
@@ -19,6 +19,9 @@ clean:
 
 docker:
 	docker compose up --build
+
+test:
+	cargo test
 
 install:
 	deploy/install.sh $(VERSION)

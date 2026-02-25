@@ -1,8 +1,3 @@
-mod config;
-mod pool;
-mod proxy;
-mod ratelimit;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,9 +10,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use config::{Config, ValidatedConfig};
-use pool::Pool;
-use proxy::ProxyHandler;
+use packet_prism::config::{Config, ValidatedConfig};
+use packet_prism::pool::Pool;
+use packet_prism::proxy::ProxyHandler;
 
 #[tokio::main]
 async fn main() {

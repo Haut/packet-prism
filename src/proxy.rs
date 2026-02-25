@@ -258,6 +258,9 @@ impl ProxyHandler {
             if name == header::HOST {
                 continue;
             }
+            if self.user_agent.is_some() && name == header::USER_AGENT {
+                continue;
+            }
             let s = name.as_str();
             if HOP_BY_HOP_HEADERS.contains(&s) {
                 continue;

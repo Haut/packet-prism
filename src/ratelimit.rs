@@ -104,3 +104,118 @@ impl Limiter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_immediate_when_full() {
+        let limiter = Limiter::new(10);
+        let start = Instant::now();
+        for _ in 0..10 {
+            limiter
+                .wait(Duration::from_secs(1))
+                .await
+                .expect("should not timeout");
+        }
+        // All 10 tokens were available at start — should complete almost instantly
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn test_exhaustion_then_refill() {
+        let limiter = Limiter::new(100); // 100 tokens/sec, refill 1 token per 10ms
+        // Drain all 100 tokens
+        for _ in 0..100 {
+            limiter.wait(Duration::from_secs(1)).await.unwrap();
+        }
+        // 101st must wait for refill (~10ms)
+        let start = Instant::now();
+        limiter.wait(Duration::from_secs(1)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(5) && elapsed < Duration::from_millis(100),
+            "expected ~10ms refill wait, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_returns_error() {
+        let limiter = Limiter::new(1); // 1 token/sec
+        // Consume the one token
+        limiter.wait(Duration::from_secs(1)).await.unwrap();
+        // Next wait with short timeout should fail
+        let result = limiter.wait(Duration::from_millis(10)).await;
+        assert!(result.is_err(), "should timeout");
+    }
+
+    #[tokio::test]
+    async fn test_refill_capped_at_max() {
+        let limiter = Limiter::new(10);
+        // Drain all 10 tokens
+        for _ in 0..10 {
+            limiter.wait(Duration::from_secs(1)).await.unwrap();
+        }
+        // Wait long enough to overfill (2 seconds at 10/sec = 20 tokens if uncapped)
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Should only get 10 tokens (the max)
+        for i in 0..10 {
+            limiter
+                .wait(Duration::from_millis(50))
+                .await
+                .unwrap_or_else(|_| panic!("token {i} should be available"));
+        }
+        // 11th should not be immediately available
+        let result = limiter.wait(Duration::from_millis(10)).await;
+        assert!(result.is_err(), "should not have more than max tokens");
+    }
+
+    #[tokio::test]
+    async fn test_high_rate_throughput() {
+        let limiter = Limiter::new(1000);
+        let start = Instant::now();
+        for _ in 0..100 {
+            limiter.wait(Duration::from_secs(5)).await.unwrap();
+        }
+        // 100 tokens at 1000/sec = 100ms theoretical minimum
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "100 tokens at 1000/sec should complete in < 500ms, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_no_over_consumption() {
+        let limiter = Arc::new(Limiter::new(10)); // starts with 10 tokens
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let limiter = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                limiter.wait(Duration::from_millis(100)).await.is_ok()
+            }));
+        }
+        let mut successes = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                successes += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        // At most 10 initial tokens + whatever refilled during the 100ms window
+        // 10 tokens/sec * 0.1sec = 1 more token, so max ~11
+        // Be generous with upper bound due to timing
+        let max_expected = 10 + (elapsed.as_millis() as u32 / 100 + 1) * 10;
+        assert!(
+            successes <= max_expected as usize,
+            "got {successes} successes but expected at most {max_expected}"
+        );
+        assert!(
+            successes >= 10,
+            "should grant at least the initial 10 tokens"
+        );
+    }
+}
