@@ -30,7 +30,8 @@ fn build_client(ip: Option<IpAddr>) -> reqwest::Client {
         .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(32)
         .tcp_keepalive(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        .tcp_nodelay(true);
 
     if let Some(addr) = ip {
         builder = builder.local_address(addr);

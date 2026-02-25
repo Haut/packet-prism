@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header;
@@ -211,11 +211,40 @@ impl ProxyHandler {
         headers: &hyper::HeaderMap,
         body: &Bytes,
     ) -> Result<reqwest::Request, ProxyError> {
-        let path = single_joining_slash(self.target_url.path(), uri.path());
-        let target = match uri.query() {
-            Some(q) => format!("{}{}?{}", self.target_base, path, q),
-            None => format!("{}{}", self.target_base, path),
-        };
+        let base_path = self.target_url.path();
+        let req_path = uri.path();
+        let query = uri.query();
+
+        let cap = self.target_base.len()
+            + base_path.len()
+            + req_path.len()
+            + query.map_or(0, |q| q.len() + 1)
+            + 1;
+        let mut target = String::with_capacity(cap);
+        target.push_str(&self.target_base);
+
+        let base_trail = base_path.ends_with('/');
+        let req_lead = req_path.starts_with('/');
+        match (base_trail, req_lead) {
+            (true, true) => {
+                target.push_str(base_path);
+                target.push_str(&req_path[1..]);
+            }
+            (false, false) => {
+                target.push_str(base_path);
+                target.push('/');
+                target.push_str(req_path);
+            }
+            _ => {
+                target.push_str(base_path);
+                target.push_str(req_path);
+            }
+        }
+
+        if let Some(q) = query {
+            target.push('?');
+            target.push_str(q);
+        }
 
         let method =
             reqwest::Method::from_bytes(method.as_str().as_bytes()).expect("valid HTTP method");
@@ -252,7 +281,7 @@ impl ProxyHandler {
 }
 
 async fn read_body(body: Incoming) -> Result<Bytes, ()> {
-    let mut collected = Vec::new();
+    let mut collected = BytesMut::with_capacity(1024);
     let mut remaining = MAX_BODY_SIZE;
     let mut stream = body;
 
@@ -272,7 +301,7 @@ async fn read_body(body: Incoming) -> Result<Bytes, ()> {
         }
     }
 
-    Ok(Bytes::from(collected))
+    Ok(collected.freeze())
 }
 
 async fn convert_response(resp: reqwest::Response) -> Response<Full<Bytes>> {
@@ -284,15 +313,20 @@ async fn convert_response(resp: reqwest::Response) -> Response<Full<Bytes>> {
     *response.status_mut() =
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    for (name, value) in resp_headers.iter() {
+    let mut last_name = None;
+    for (opt_name, value) in resp_headers.into_iter() {
+        if let Some(n) = opt_name {
+            last_name = Some(n);
+        }
+        let name = last_name.as_ref().unwrap();
         let s = name.as_str();
         if HOP_BY_HOP_HEADERS.contains(&s) {
             continue;
         }
-        if name == header::CONTENT_ENCODING || name == header::CONTENT_LENGTH {
+        if *name == header::CONTENT_ENCODING || *name == header::CONTENT_LENGTH {
             continue;
         }
-        response.headers_mut().append(name.clone(), value.clone());
+        response.headers_mut().append(name.clone(), value);
     }
 
     response
@@ -302,14 +336,4 @@ fn error_response(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
     let mut resp = Response::new(Full::new(Bytes::from(format!("{msg}\n"))));
     *resp.status_mut() = status;
     resp
-}
-
-fn single_joining_slash(base: &str, path: &str) -> String {
-    let a = base.ends_with('/');
-    let b = path.starts_with('/');
-    match (a, b) {
-        (true, true) => format!("{}{}", base, &path[1..]),
-        (false, false) => format!("{base}/{path}"),
-        _ => format!("{base}{path}"),
-    }
 }

@@ -97,6 +97,8 @@ async fn main() {
                     }
                 };
 
+                stream.set_nodelay(true).ok();
+
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
