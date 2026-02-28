@@ -48,7 +48,8 @@ fn build_client(ip: Option<IpAddr>) -> reqwest::Client {
         .pool_max_idle_per_host(32)
         .tcp_keepalive(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
-        .tcp_nodelay(true);
+        .tcp_nodelay(true)
+        .no_proxy();
 
     if let Some(addr) = ip {
         builder = builder.local_address(addr);
