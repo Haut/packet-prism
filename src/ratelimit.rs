@@ -13,8 +13,8 @@ pub struct Limiter {
     tokens: AtomicU64,
     /// Last refill timestamp in nanoseconds since epoch.
     last_refill_ns: AtomicU64,
-    /// Refill rate in microtokens per nanosecond (pre-calculated).
-    rate_micro_per_ns: u64,
+    /// Tokens per second (kept as-is to avoid integer truncation in refill math).
+    rate_per_sec: u64,
     /// Maximum tokens in microtokens.
     max_micro: u64,
     epoch: Instant,
@@ -24,12 +24,10 @@ impl Limiter {
     pub fn new(rate_per_second: u32) -> Self {
         let rate = u64::from(rate_per_second);
         let max_micro = rate * MICRO;
-        // rate_per_second tokens/sec = rate * MICRO microtokens / 1_000_000_000 ns
-        // To avoid losing precision, we store the rate and compute inline.
         Limiter {
             tokens: AtomicU64::new(max_micro),
             last_refill_ns: AtomicU64::new(0),
-            rate_micro_per_ns: rate, // actual rate = rate * MICRO / 1e9; computed inline
+            rate_per_sec: rate,
             max_micro,
             epoch: Instant::now(),
         }
@@ -49,8 +47,8 @@ impl Limiter {
             let elapsed_ns = now_ns.saturating_sub(prev_ns);
 
             if elapsed_ns > 0 {
-                // microtokens to add = elapsed_ns * rate_per_sec * MICRO / 1_000_000_000
-                let add = elapsed_ns.saturating_mul(self.rate_micro_per_ns) / 1_000; // (MICRO / 1e9 = 1/1000)
+                // microtokens = elapsed_ns * rate_per_sec * MICRO / 1e9 = elapsed_ns * rate / 1_000
+                let add = elapsed_ns.saturating_mul(self.rate_per_sec) / 1_000;
 
                 if add > 0 {
                     // Try to advance the refill timestamp.
@@ -90,11 +88,9 @@ impl Limiter {
                 return Err(RateLimitTimeout);
             }
 
-            // Sleep for estimated refill time of one token.
-            // 1 token = MICRO microtokens; rate = rate_micro_per_ns * MICRO / 1e9 microtokens/ns
-            // time_for_one_token_ns = 1e9 / rate_per_sec = 1_000_000_000 / rate_micro_per_ns
+            // Sleep for one token interval: 1e9 / rate_per_sec nanoseconds.
             let sleep_ns = 1_000_000_000u64
-                .checked_div(self.rate_micro_per_ns)
+                .checked_div(self.rate_per_sec)
                 .unwrap_or(1_000_000);
 
             let remaining = deadline_ns.saturating_sub(now_ns);

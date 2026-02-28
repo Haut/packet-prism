@@ -58,11 +58,12 @@ pub struct ProxyHandler {
     pool: Arc<Pool>,
     cooldown: Duration,
     limiter: Option<(Arc<Limiter>, Duration)>,
-    target_url: Url,
     target_base: String,
+    base_path: String,
     host_header: Option<String>,
     user_agent: Option<String>,
-    outgoing_client: reqwest::Client,
+    /// Used only as a request-builder factory; all actual I/O goes through slot clients.
+    req_client: reqwest::Client,
 }
 
 impl ProxyHandler {
@@ -95,20 +96,19 @@ impl ProxyHandler {
                 .unwrap_or_default()
         );
 
-        let outgoing_client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("failed to build outgoing client");
+        let base_path = target_url.path().to_string();
+
+        let req_client = reqwest::Client::new();
 
         Self {
             pool,
             cooldown,
             limiter,
-            target_url,
             target_base,
+            base_path,
             host_header,
             user_agent,
-            outgoing_client,
+            req_client,
         }
     }
 
@@ -211,7 +211,7 @@ impl ProxyHandler {
         parts: &hyper::http::request::Parts,
         body: &Bytes,
     ) -> Result<reqwest::Request, ProxyError> {
-        let base_path = self.target_url.path();
+        let base_path = &self.base_path;
         let req_path = parts.uri.path();
         let query = parts.uri.query();
 
@@ -250,7 +250,7 @@ impl ProxyHandler {
             .expect("valid HTTP method");
 
         let mut builder = self
-            .outgoing_client
+            .req_client
             .request(method, &target)
             .body(body.clone());
 
